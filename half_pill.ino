@@ -1,11 +1,11 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <EEPROM.h>
-#include <SPI.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
 #include <time.h>
+#include <Preferences.h>
+
 
 // ========== BOOT BITMAP (separate file) ==========
 #include "boot_img.h"
@@ -21,7 +21,7 @@ const char* password = "";
 #define CHSC6X_READ_POINT_LEN 5
 #define TOUCH_INT      D7
 // brightness controls
-#define BACKLIGHT_PIN  21        // Round Display Backlight Pin
+#define BACKLIGHT_PIN  21       // Round Display Backlight Pin
 #define PWM_FREQ       5000     // 5 kHz frequency to eliminate audible buzzing
 #define PWM_RES        8        // 8-bit resolution (values from 0 to 255)
 int activeBrightness = 255;
@@ -32,26 +32,21 @@ TFT_eSPI tft = TFT_eSPI();
 // ========== NTP & Timezone (IST = UTC+5:30) ==========
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
-int timezoneMinutes = 330;   // UTC+5:30
+String timezone = "UTC0";
 
-// ========== EEPROM ==========
-#define EEPROM_SIZE     512
-#define EEPROM_PILL_COUNT_ADDR    0
-#define EEPROM_PILL_DATA_ADDR     4
-#define EEPROM_TZ_ADDR            200
-#define EEPROM_ACTIVE_BRIGHT_ADDR 500
-#define EEPROM_IDLE_BRIGHT_ADDR   501
-#define MAX_PILLS       20
+// ========== Storage ==========
+Preferences preferences;
+#define MAX_MEDS       20
 
-struct Pill {
+struct Med {
   char name[24];
   int  hour;
   int  minute;
   bool active;
   bool takenToday;
 };
-Pill pills[MAX_PILLS];
-int pillCount = 0;
+Med meds[MAX_MEDS];
+int medCount = 0;
 
 // ========== Global State ==========
 WebServer server(80);
@@ -102,85 +97,87 @@ bool chsc6x_get_xy(int32_t &x, int32_t &y) {
 }
 
 // ========== Display Brightness ======
-// Helper function to dynamically change brightness (0 to 100)
 void setBrightness(int value) {
   if (value < 0)   value = 0;
   if (value > 255) value = 255;
-  //value = value * 2.55;
   ledcWrite(BACKLIGHT_PIN, value);
 }
 
-// ========== EEPROM Helpers ==========
-void savePills() {
-  EEPROM.writeInt(EEPROM_PILL_COUNT_ADDR, pillCount);
-  for (int i = 0; i < pillCount; i++) {
-    int addr = EEPROM_PILL_DATA_ADDR + i * sizeof(Pill);
-    EEPROM.put(addr, pills[i]);
+// ========== Storage Helpers ==========
+void saveMeds() {
+  preferences.begin("meds", false);
+  preferences.putInt("medCount", medCount);
+  for (int i = 0; i < medCount; i++) {
+    preferences.putBytes("med" + i, &meds[i], sizeof(Med));
   }
-  EEPROM.commit();
+  preferences.end();
 }
 
-void loadPills() {
-  pillCount = EEPROM.readInt(EEPROM_PILL_COUNT_ADDR);
-  if (pillCount < 0 || pillCount > MAX_PILLS) pillCount = 0;
-  for (int i = 0; i < pillCount; i++) {
-    int addr = EEPROM_PILL_DATA_ADDR + i * sizeof(Pill);
-    EEPROM.get(addr, pills[i]);
+void loadMeds() {
+  preferences.begin("meds", true);
+  medCount = preferences.getInt("medCount", 0);
+  if (medCount < 0 || medCount > MAX_MEDS) medCount = 0;
+  for (int i = 0; i < medCount; i++) {
+    preferences.getBytes("med" + i, &meds[i], sizeof(Med));
   }
+  preferences.end();
 }
 
 void saveTimezone() {
-  EEPROM.writeInt(EEPROM_TZ_ADDR, timezoneMinutes);
-  EEPROM.commit();
+  preferences.begin("config", false);
+  preferences.putString("timezone", timezone);
+  preferences.end();
 }
 
 void loadTimezone() {
-  timezoneMinutes = EEPROM.readInt(EEPROM_TZ_ADDR);
-  if (timezoneMinutes < -720 || timezoneMinutes > 840) timezoneMinutes = 330;
+  preferences.begin("config", true);
+  timezone = preferences.getString("timezone", "UTC0");
+  preferences.end();
 }
 
 void saveActiveBrightness() {
-  EEPROM.writeInt(EEPROM_ACTIVE_BRIGHT_ADDR, activeBrightness);
-  EEPROM.commit();
+  preferences.begin("config", false);
+  preferences.putInt("activeBrightness", activeBrightness);
+  preferences.end();
 }
 
 void loadActiveBrightness() {
-  activeBrightness = EEPROM.readInt(EEPROM_ACTIVE_BRIGHT_ADDR);
+  preferences.begin("config", true);
+  activeBrightness = preferences.getInt("activeBrightness", 255);
+  preferences.end();
   if (activeBrightness < 0 || activeBrightness > 255) activeBrightness = 255;
 }
 
 void saveIdleBrightness() {
-  EEPROM.writeInt(EEPROM_IDLE_BRIGHT_ADDR, idleBrightness);
-  EEPROM.commit();
+  preferences.begin("config", false);
+  preferences.putInt("idleBrightness", idleBrightness);
+  preferences.end();
 }
 
 void loadIdleBrightness() {
-  idleBrightness = EEPROM.readInt(EEPROM_IDLE_BRIGHT_ADDR);
+  preferences.begin("config", true);
+  idleBrightness = preferences.getInt("idleBrightness", 10);
+  preferences.end();
   if (idleBrightness < 0 || idleBrightness > 255) idleBrightness = 10;
 }
 
 // ========== Time Formatting ==========
-String get12HourTimeNoAmPm() {
+String getTimeAsString() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "--:--";
   char buffer[6];
-  int hour = timeinfo.tm_hour % 12;
-  if (hour == 0) hour = 12;
-  sprintf(buffer, "%d:%02d", hour, timeinfo.tm_min);
+  sprintf(buffer, "%d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
   return String(buffer);
 }
 
-String format12HourAmPm(int hour, int minute) {
-  int dispHour = hour % 12;
-  if (dispHour == 0) dispHour = 12;
+String formatTimeAsString(int hour, int minute) {
   char buffer[10];
-  const char* ampm = hour >= 12 ? "pm" : "am";
-  sprintf(buffer, "%d:%02d%s", dispHour, minute, ampm);
+  sprintf(buffer, "%d:%02d", hour, minute);
   return String(buffer);
 }
 
 void syncTime() {
-  configTime(timezoneMinutes * 60, 0, ntpServer1, ntpServer2);
+  configTzTime(timezone.c_str(), ntpServer1, ntpServer2);
   struct tm timeinfo;
   int retry = 0;
   while (!getLocalTime(&timeinfo) && retry < 20) {
@@ -189,7 +186,7 @@ void syncTime() {
   }
 }
 
-// ========== Pill Management ==========
+// ========== Med Management ==========
 int findNextReminderIndex() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return -1;
@@ -197,17 +194,17 @@ int findNextReminderIndex() {
   
   int bestIdx = -1;
   int bestTime = 24*60;
-  for (int i = 0; i < pillCount; i++) {
-    if (!pills[i].active || pills[i].takenToday) continue;
-    int pillMinutes = pills[i].hour * 60 + pills[i].minute;
-    if (pillMinutes >= nowMinutes && pillMinutes < bestTime) {
-      bestTime = pillMinutes;
+  for (int i = 0; i < medCount; i++) {
+    if (!meds[i].active || meds[i].takenToday) continue;
+    int medMinutes = meds[i].hour * 60 + meds[i].minute;
+    if (medMinutes >= nowMinutes && medMinutes < bestTime) {
+      bestTime = medMinutes;
       bestIdx = i;
     }
   }
   if (bestIdx == -1) {
-    for (int i = 0; i < pillCount; i++) {
-      if (pills[i].active && !pills[i].takenToday) {
+    for (int i = 0; i < medCount; i++) {
+      if (meds[i].active && !meds[i].takenToday) {
         bestIdx = i;
         break;
       }
@@ -222,10 +219,10 @@ void checkReminders() {
   if (!getLocalTime(&timeinfo)) return;
   int nowMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
   
-  for (int i = 0; i < pillCount; i++) {
-    if (!pills[i].active || pills[i].takenToday) continue;
-    int pillMinutes = pills[i].hour * 60 + pills[i].minute;
-    if (pillMinutes == nowMinutes) {
+  for (int i = 0; i < medCount; i++) {
+    if (!meds[i].active || meds[i].takenToday) continue;
+    int medMinutes = meds[i].hour * 60 + meds[i].minute;
+    if (medMinutes <= nowMinutes) {
       reminderActive = true;
       reminderIndex = i;
       drawReminderScreen(i);
@@ -240,7 +237,7 @@ void drawClockScreen() {
   
   tft.setFreeFont(&FreeSansBold24pt7b);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  String timeStr = get12HourTimeNoAmPm();
+  String timeStr = getTimeAsString();
   int timeWidth = tft.textWidth(timeStr);
   lastTimeX = (SCREEN_WIDTH - timeWidth) / 2;
   lastTimeY = 95;
@@ -252,13 +249,13 @@ void drawClockScreen() {
   
   int nextIdx = findNextReminderIndex();
   if (nextIdx >= 0) {
-    String line1 = "Next : " + String(pills[nextIdx].name);
+    String line1 = "Next : " + String(meds[nextIdx].name);
     int w1 = tft.textWidth(line1);
     tft.drawString(line1, (SCREEN_WIDTH - w1) / 2, 160);
     
-    String timeAmPm = format12HourAmPm(pills[nextIdx].hour, pills[nextIdx].minute);
-    int w2 = tft.textWidth(timeAmPm);
-    tft.drawString(timeAmPm, (SCREEN_WIDTH - w2) / 2, 190);
+    String nextTime = formatTimeAsString(meds[nextIdx].hour, meds[nextIdx].minute);
+    int w2 = tft.textWidth(nextTime);
+    tft.drawString(nextTime, (SCREEN_WIDTH - w2) / 2, 190);
   } else {
     String noRem = "No reminders";
     int w = tft.textWidth(noRem);
@@ -271,7 +268,7 @@ void drawClockScreen() {
 void updateClockTime() {
   if (!clockInitialised) return;
   
-  String newTime = get12HourTimeNoAmPm();
+  String newTime = getTimeAsString();
   if (newTime == lastTimeStr) return;
   
   tft.setFreeFont(&FreeSansBold24pt7b);
@@ -291,25 +288,25 @@ void drawReminderScreen(int idx) {
   tft.fillScreen(TFT_RED);
   tft.setTextColor(TFT_WHITE, TFT_RED);
   
-  tft.setFreeFont(&FreeSansBold24pt7b);
-  tft.drawString("Pill Time", 22, 88);
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.drawString("Take Meds", 24, 88);
   
   tft.setFreeFont(&FreeSans12pt7b);
-  String pillName = String(pills[idx].name);
-  int nameWidth = tft.textWidth(pillName);
+  String medName = String(meds[idx].name);
+  int nameWidth = tft.textWidth(medName);
   int nameX = (SCREEN_WIDTH - nameWidth) / 2;
-  tft.drawString(pillName, nameX, 136);
+  tft.drawString(medName, nameX, 136);
   
   tft.setFreeFont(&FreeSans9pt7b);
   tft.drawString("Tap to take", 75, 204);
   setBrightness(activeBrightness);
 }
 
-void drawPillTakenScreen() {
+void drawMedTakenScreen() {
   tft.fillScreen(TFT_DARKGREEN);
   tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
   tft.setFreeFont(&FreeSans18pt7b);
-  tft.drawString("Pill taken!", 30, 100);
+  tft.drawString("Med taken!", 30, 100);
   delay(1500);
 }
 
@@ -327,7 +324,7 @@ void handleRoot() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-  <title>Pill Reminder</title>
+  <title>Med Reminder</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -365,13 +362,13 @@ void handleRoot() {
       border-bottom: 1px solid #334155;
       padding-bottom: 16px;
     }
-    .pill-list {
+    .med-list {
       display: flex;
       flex-direction: column;
       gap: 12px;
       margin-bottom: 20px;
     }
-    .pill-item {
+    .med-item {
       background: rgba(30, 41, 59, 0.7);
       border-radius: 20px;
       padding: 16px;
@@ -381,16 +378,16 @@ void handleRoot() {
       backdrop-filter: blur(5px);
       border: 1px solid rgba(255,255,255,0.05);
     }
-    .pill-info {
+    .med-info {
       display: flex;
       flex-direction: column;
     }
-    .pill-name {
+    .med-name {
       color: #f1f5f9;
       font-size: 18px;
       font-weight: 600;
     }
-    .pill-time {
+    .med-time {
       color: #7dd3fc;
       font-size: 15px;
       margin-top: 4px;
@@ -511,23 +508,23 @@ void handleRoot() {
 </head>
 <body>
 <div class="card">
-  <h1>💊 Pill Reminder</h1>
+  <h1>💊 Med Reminder</h1>
   <div class="subtitle">Connected to )rawliteral" + localIP + R"rawliteral(</div>
   
-  <div id="pillList" class="pill-list"></div>
+  <div id="medList" class="med-list"></div>
   <button class="add-button" onclick="showForm()">➕ Add Medication</button>
   
   <div id="addForm" class="form-popup">
-    <h3 style="color:#a5f3fc; margin-bottom:20px;">New Pill</h3>
+    <h3 style="color:#a5f3fc; margin-bottom:20px;">New Med</h3>
     <div class="form-group">
-      <input type="text" id="pillName" placeholder="Name (e.g. Vitamin D)">
+      <input type="text" id="medName" placeholder="Name (e.g. Vitamin D)">
     </div>
     <div class="form-group" style="display:flex; gap:10px;">
       <input type="number" id="hour" placeholder="Hour (0-23)" min="0" max="23">
       <input type="number" id="minute" placeholder="Minute (0-59)" min="0" max="59">
     </div>
     <div style="display:flex; gap:10px;">
-      <button class="btn" onclick="savePill()">Save</button>
+      <button class="btn" onclick="saveMed()">Save</button>
       <button class="btn cancel" onclick="hideForm()">Cancel</button>
     </div>
   </div>
@@ -545,50 +542,498 @@ void handleRoot() {
   <div class="section-title">⚙️ Timezone</div>
   <div class="config-group">
     <label>UTC Offset</label>
+    <!-- https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv?plain=1 -->
     <select id="timezoneSelect">
-      <option value="-720">UTC-12:00</option><option value="-660">UTC-11:00</option>
-      <option value="-600">UTC-10:00</option><option value="-540">UTC-09:00</option>
-      <option value="-480">UTC-08:00</option><option value="-420">UTC-07:00</option>
-      <option value="-360">UTC-06:00</option><option value="-300">UTC-05:00</option>
-      <option value="-240">UTC-04:00</option><option value="-180">UTC-03:00</option>
-      <option value="-120">UTC-02:00</option><option value="-60">UTC-01:00</option>
-      <option value="0">UTC±00:00</option><option value="60">UTC+01:00</option>
-      <option value="120">UTC+02:00</option><option value="180">UTC+03:00</option>
-      <option value="240">UTC+04:00</option><option value="300">UTC+05:00</option>
-      <option value="330" selected>UTC+05:30 (IST)</option>
-      <option value="360">UTC+06:00</option><option value="420">UTC+07:00</option>
-      <option value="480">UTC+08:00</option><option value="540">UTC+09:00</option>
-      <option value="600">UTC+10:00</option><option value="660">UTC+11:00</option>
-      <option value="720">UTC+12:00</option>
+      <option value="GMT0">Africa/Abidjan</option>
+      <option value="GMT0">Africa/Accra</option>
+      <option value="EAT-3">Africa/Addis_Ababa</option>
+      <option value="CET-1">Africa/Algiers</option>
+      <option value="EAT-3">Africa/Asmara</option>
+      <option value="GMT0">Africa/Bamako</option>
+      <option value="WAT-1">Africa/Bangui</option>
+      <option value="GMT0">Africa/Banjul</option>
+      <option value="GMT0">Africa/Bissau</option>
+      <option value="CAT-2">Africa/Blantyre</option>
+      <option value="WAT-1">Africa/Brazzaville</option>
+      <option value="CAT-2">Africa/Bujumbura</option>
+      <option value="EET-2EEST,M4.5.5/0,M10.5.4/24">Africa/Cairo</option>
+      <option value="<+01>-1">Africa/Casablanca</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Africa/Ceuta</option>
+      <option value="GMT0">Africa/Conakry</option>
+      <option value="GMT0">Africa/Dakar</option>
+      <option value="EAT-3">Africa/Dar_es_Salaam</option>
+      <option value="EAT-3">Africa/Djibouti</option>
+      <option value="WAT-1">Africa/Douala</option>
+      <option value="<+01>-1">Africa/El_Aaiun</option>
+      <option value="GMT0">Africa/Freetown</option>
+      <option value="CAT-2">Africa/Gaborone</option>
+      <option value="CAT-2">Africa/Harare</option>
+      <option value="SAST-2">Africa/Johannesburg</option>
+      <option value="CAT-2">Africa/Juba</option>
+      <option value="EAT-3">Africa/Kampala</option>
+      <option value="CAT-2">Africa/Khartoum</option>
+      <option value="CAT-2">Africa/Kigali</option>
+      <option value="WAT-1">Africa/Kinshasa</option>
+      <option value="WAT-1">Africa/Lagos</option>
+      <option value="WAT-1">Africa/Libreville</option>
+      <option value="GMT0">Africa/Lome</option>
+      <option value="WAT-1">Africa/Luanda</option>
+      <option value="CAT-2">Africa/Lubumbashi</option>
+      <option value="CAT-2">Africa/Lusaka</option>
+      <option value="WAT-1">Africa/Malabo</option>
+      <option value="CAT-2">Africa/Maputo</option>
+      <option value="SAST-2">Africa/Maseru</option>
+      <option value="SAST-2">Africa/Mbabane</option>
+      <option value="EAT-3">Africa/Mogadishu</option>
+      <option value="GMT0">Africa/Monrovia</option>
+      <option value="EAT-3">Africa/Nairobi</option>
+      <option value="WAT-1">Africa/Ndjamena</option>
+      <option value="WAT-1">Africa/Niamey</option>
+      <option value="GMT0">Africa/Nouakchott</option>
+      <option value="GMT0">Africa/Ouagadougou</option>
+      <option value="WAT-1">Africa/Porto-Novo</option>
+      <option value="GMT0">Africa/Sao_Tome</option>
+      <option value="EET-2">Africa/Tripoli</option>
+      <option value="CET-1">Africa/Tunis</option>
+      <option value="CAT-2">Africa/Windhoek</option>
+      <option value="HST10HDT,M3.2.0,M11.1.0">America/Adak</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Anchorage</option>
+      <option value="AST4">America/Anguilla</option>
+      <option value="AST4">America/Antigua</option>
+      <option value="<-03>3">America/Araguaina</option>
+      <option value="<-03>3">America/Argentina/Buenos_Aires</option>
+      <option value="<-03>3">America/Argentina/Catamarca</option>
+      <option value="<-03>3">America/Argentina/Cordoba</option>
+      <option value="<-03>3">America/Argentina/Jujuy</option>
+      <option value="<-03>3">America/Argentina/La_Rioja</option>
+      <option value="<-03>3">America/Argentina/Mendoza</option>
+      <option value="<-03>3">America/Argentina/Rio_Gallegos</option>
+      <option value="<-03>3">America/Argentina/Salta</option>
+      <option value="<-03>3">America/Argentina/San_Juan</option>
+      <option value="<-03>3">America/Argentina/San_Luis</option>
+      <option value="<-03>3">America/Argentina/Tucuman</option>
+      <option value="<-03>3">America/Argentina/Ushuaia</option>
+      <option value="AST4">America/Aruba</option>
+      <option value="<-03>3">America/Asuncion</option>
+      <option value="EST5">America/Atikokan</option>
+      <option value="<-03>3">America/Bahia</option>
+      <option value="CST6">America/Bahia_Banderas</option>
+      <option value="AST4">America/Barbados</option>
+      <option value="<-03>3">America/Belem</option>
+      <option value="CST6">America/Belize</option>
+      <option value="AST4">America/Blanc-Sablon</option>
+      <option value="<-04>4">America/Boa_Vista</option>
+      <option value="<-05>5">America/Bogota</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Boise</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Cambridge_Bay</option>
+      <option value="<-04>4">America/Campo_Grande</option>
+      <option value="EST5">America/Cancun</option>
+      <option value="<-04>4">America/Caracas</option>
+      <option value="<-03>3">America/Cayenne</option>
+      <option value="EST5">America/Cayman</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Chicago</option>
+      <option value="CST6">America/Chihuahua</option>
+      <option value="CST6">America/Costa_Rica</option>
+      <option value="MST7">America/Creston</option>
+      <option value="<-04>4">America/Cuiaba</option>
+      <option value="AST4">America/Curacao</option>
+      <option value="GMT0">America/Danmarkshavn</option>
+      <option value="MST7">America/Dawson</option>
+      <option value="MST7">America/Dawson_Creek</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Denver</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Detroit</option>
+      <option value="AST4">America/Dominica</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Edmonton</option>
+      <option value="<-05>5">America/Eirunepe</option>
+      <option value="CST6">America/El_Salvador</option>
+      <option value="<-03>3">America/Fortaleza</option>
+      <option value="MST7">America/Fort_Nelson</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">America/Glace_Bay</option>
+      <option value="<-02>2<-01>,M3.5.0/-1,M10.5.0/0">America/Godthab</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">America/Goose_Bay</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Grand_Turk</option>
+      <option value="AST4">America/Grenada</option>
+      <option value="AST4">America/Guadeloupe</option>
+      <option value="CST6">America/Guatemala</option>
+      <option value="<-05>5">America/Guayaquil</option>
+      <option value="<-04>4">America/Guyana</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">America/Halifax</option>
+      <option value="CST5CDT,M3.2.0/0,M11.1.0/1">America/Havana</option>
+      <option value="MST7">America/Hermosillo</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Indianapolis</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Indiana/Knox</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Marengo</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Petersburg</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Indiana/Tell_City</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Vevay</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Vincennes</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Indiana/Winamac</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Inuvik</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Iqaluit</option>
+      <option value="EST5">America/Jamaica</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Juneau</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Kentucky/Louisville</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Kentucky/Monticello</option>
+      <option value="AST4">America/Kralendijk</option>
+      <option value="<-04>4">America/La_Paz</option>
+      <option value="<-05>5">America/Lima</option>
+      <option value="PST8PDT,M3.2.0,M11.1.0">America/Los_Angeles</option>
+      <option value="AST4">America/Lower_Princes</option>
+      <option value="<-03>3">America/Maceio</option>
+      <option value="CST6">America/Managua</option>
+      <option value="<-04>4">America/Manaus</option>
+      <option value="AST4">America/Marigot</option>
+      <option value="AST4">America/Martinique</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Matamoros</option>
+      <option value="MST7">America/Mazatlan</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Menominee</option>
+      <option value="CST6">America/Merida</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Metlakatla</option>
+      <option value="CST6">America/Mexico_City</option>
+      <option value="<-03>3<-02>,M3.2.0,M11.1.0">America/Miquelon</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">America/Moncton</option>
+      <option value="CST6">America/Monterrey</option>
+      <option value="<-03>3">America/Montevideo</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Montreal</option>
+      <option value="AST4">America/Montserrat</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Nassau</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/New_York</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Nipigon</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Nome</option>
+      <option value="<-02>2">America/Noronha</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/North_Dakota/Beulah</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/North_Dakota/Center</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/North_Dakota/New_Salem</option>
+      <option value="<-02>2<-01>,M3.5.0/-1,M10.5.0/0">America/Nuuk</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Ojinaga</option>
+      <option value="EST5">America/Panama</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Pangnirtung</option>
+      <option value="<-03>3">America/Paramaribo</option>
+      <option value="MST7">America/Phoenix</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Port-au-Prince</option>
+      <option value="AST4">America/Port_of_Spain</option>
+      <option value="<-04>4">America/Porto_Velho</option>
+      <option value="AST4">America/Puerto_Rico</option>
+      <option value="<-03>3">America/Punta_Arenas</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Rainy_River</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Rankin_Inlet</option>
+      <option value="<-03>3">America/Recife</option>
+      <option value="CST6">America/Regina</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Resolute</option>
+      <option value="<-05>5">America/Rio_Branco</option>
+      <option value="<-03>3">America/Santarem</option>
+      <option value="<-04>4<-03>,M9.1.6/24,M4.1.6/24">America/Santiago</option>
+      <option value="AST4">America/Santo_Domingo</option>
+      <option value="<-03>3">America/Sao_Paulo</option>
+      <option value="<-02>2<-01>,M3.5.0/-1,M10.5.0/0">America/Scoresbysund</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Sitka</option>
+      <option value="AST4">America/St_Barthelemy</option>
+      <option value="NST3:30NDT,M3.2.0,M11.1.0">America/St_Johns</option>
+      <option value="AST4">America/St_Kitts</option>
+      <option value="AST4">America/St_Lucia</option>
+      <option value="AST4">America/St_Thomas</option>
+      <option value="AST4">America/St_Vincent</option>
+      <option value="CST6">America/Swift_Current</option>
+      <option value="CST6">America/Tegucigalpa</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">America/Thule</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Thunder_Bay</option>
+      <option value="PST8PDT,M3.2.0,M11.1.0">America/Tijuana</option>
+      <option value="EST5EDT,M3.2.0,M11.1.0">America/Toronto</option>
+      <option value="AST4">America/Tortola</option>
+      <option value="PST8PDT,M3.2.0,M11.1.0">America/Vancouver</option>
+      <option value="MST7">America/Whitehorse</option>
+      <option value="CST6CDT,M3.2.0,M11.1.0">America/Winnipeg</option>
+      <option value="AKST9AKDT,M3.2.0,M11.1.0">America/Yakutat</option>
+      <option value="MST7MDT,M3.2.0,M11.1.0">America/Yellowknife</option>
+      <option value="<+08>-8">Antarctica/Casey</option>
+      <option value="<+07>-7">Antarctica/Davis</option>
+      <option value="<+10>-10">Antarctica/DumontDUrville</option>
+      <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Antarctica/Macquarie</option>
+      <option value="<+05>-5">Antarctica/Mawson</option>
+      <option value="NZST-12NZDT,M9.5.0,M4.1.0/3">Antarctica/McMurdo</option>
+      <option value="<-03>3">Antarctica/Palmer</option>
+      <option value="<-03>3">Antarctica/Rothera</option>
+      <option value="<+03>-3">Antarctica/Syowa</option>
+      <option value="<+00>0<+02>-2,M3.5.0/1,M10.5.0/3">Antarctica/Troll</option>
+      <option value="<+05>-5">Antarctica/Vostok</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Arctic/Longyearbyen</option>
+      <option value="<+03>-3">Asia/Aden</option>
+      <option value="<+05>-5">Asia/Almaty</option>
+      <option value="<+03>-3">Asia/Amman</option>
+      <option value="<+12>-12">Asia/Anadyr</option>
+      <option value="<+05>-5">Asia/Aqtau</option>
+      <option value="<+05>-5">Asia/Aqtobe</option>
+      <option value="<+05>-5">Asia/Ashgabat</option>
+      <option value="<+05>-5">Asia/Atyrau</option>
+      <option value="<+03>-3">Asia/Baghdad</option>
+      <option value="<+03>-3">Asia/Bahrain</option>
+      <option value="<+04>-4">Asia/Baku</option>
+      <option value="<+07>-7">Asia/Bangkok</option>
+      <option value="<+07>-7">Asia/Barnaul</option>
+      <option value="EET-2EEST,M3.5.0/0,M10.5.0/0">Asia/Beirut</option>
+      <option value="<+06>-6">Asia/Bishkek</option>
+      <option value="<+08>-8">Asia/Brunei</option>
+      <option value="<+09>-9">Asia/Chita</option>
+      <option value="<+08>-8">Asia/Choibalsan</option>
+      <option value="<+0530>-5:30">Asia/Colombo</option>
+      <option value="<+03>-3">Asia/Damascus</option>
+      <option value="<+06>-6">Asia/Dhaka</option>
+      <option value="<+09>-9">Asia/Dili</option>
+      <option value="<+04>-4">Asia/Dubai</option>
+      <option value="<+05>-5">Asia/Dushanbe</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Asia/Famagusta</option>
+      <option value="EET-2EEST,M3.4.4/50,M10.4.4/50">Asia/Gaza</option>
+      <option value="EET-2EEST,M3.4.4/50,M10.4.4/50">Asia/Hebron</option>
+      <option value="<+07>-7">Asia/Ho_Chi_Minh</option>
+      <option value="HKT-8">Asia/Hong_Kong</option>
+      <option value="<+07>-7">Asia/Hovd</option>
+      <option value="<+08>-8">Asia/Irkutsk</option>
+      <option value="WIB-7">Asia/Jakarta</option>
+      <option value="WIT-9">Asia/Jayapura</option>
+      <option value="IST-2IDT,M3.4.4/26,M10.5.0">Asia/Jerusalem</option>
+      <option value="<+0430>-4:30">Asia/Kabul</option>
+      <option value="<+12>-12">Asia/Kamchatka</option>
+      <option value="PKT-5">Asia/Karachi</option>
+      <option value="<+0545>-5:45">Asia/Kathmandu</option>
+      <option value="<+09>-9">Asia/Khandyga</option>
+      <option value="IST-5:30">Asia/Kolkata</option>
+      <option value="<+07>-7">Asia/Krasnoyarsk</option>
+      <option value="<+08>-8">Asia/Kuala_Lumpur</option>
+      <option value="<+08>-8">Asia/Kuching</option>
+      <option value="<+03>-3">Asia/Kuwait</option>
+      <option value="CST-8">Asia/Macau</option>
+      <option value="<+11>-11">Asia/Magadan</option>
+      <option value="WITA-8">Asia/Makassar</option>
+      <option value="PST-8">Asia/Manila</option>
+      <option value="<+04>-4">Asia/Muscat</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Asia/Nicosia</option>
+      <option value="<+07>-7">Asia/Novokuznetsk</option>
+      <option value="<+07>-7">Asia/Novosibirsk</option>
+      <option value="<+06>-6">Asia/Omsk</option>
+      <option value="<+05>-5">Asia/Oral</option>
+      <option value="<+07>-7">Asia/Phnom_Penh</option>
+      <option value="WIB-7">Asia/Pontianak</option>
+      <option value="KST-9">Asia/Pyongyang</option>
+      <option value="<+03>-3">Asia/Qatar</option>
+      <option value="<+05>-5">Asia/Qyzylorda</option>
+      <option value="<+03>-3">Asia/Riyadh</option>
+      <option value="<+11>-11">Asia/Sakhalin</option>
+      <option value="<+05>-5">Asia/Samarkand</option>
+      <option value="KST-9">Asia/Seoul</option>
+      <option value="CST-8">Asia/Shanghai</option>
+      <option value="<+08>-8">Asia/Singapore</option>
+      <option value="<+11>-11">Asia/Srednekolymsk</option>
+      <option value="CST-8">Asia/Taipei</option>
+      <option value="<+05>-5">Asia/Tashkent</option>
+      <option value="<+04>-4">Asia/Tbilisi</option>
+      <option value="<+0330>-3:30">Asia/Tehran</option>
+      <option value="<+06>-6">Asia/Thimphu</option>
+      <option value="JST-9">Asia/Tokyo</option>
+      <option value="<+07>-7">Asia/Tomsk</option>
+      <option value="<+08>-8">Asia/Ulaanbaatar</option>
+      <option value="<+06>-6">Asia/Urumqi</option>
+      <option value="<+10>-10">Asia/Ust-Nera</option>
+      <option value="<+07>-7">Asia/Vientiane</option>
+      <option value="<+10>-10">Asia/Vladivostok</option>
+      <option value="<+09>-9">Asia/Yakutsk</option>
+      <option value="<+0630>-6:30">Asia/Yangon</option>
+      <option value="<+05>-5">Asia/Yekaterinburg</option>
+      <option value="<+04>-4">Asia/Yerevan</option>
+      <option value="<-01>1<+00>,M3.5.0/0,M10.5.0/1">Atlantic/Azores</option>
+      <option value="AST4ADT,M3.2.0,M11.1.0">Atlantic/Bermuda</option>
+      <option value="WET0WEST,M3.5.0/1,M10.5.0">Atlantic/Canary</option>
+      <option value="<-01>1">Atlantic/Cape_Verde</option>
+      <option value="WET0WEST,M3.5.0/1,M10.5.0">Atlantic/Faroe</option>
+      <option value="WET0WEST,M3.5.0/1,M10.5.0">Atlantic/Madeira</option>
+      <option value="GMT0">Atlantic/Reykjavik</option>
+      <option value="<-02>2">Atlantic/South_Georgia</option>
+      <option value="<-03>3">Atlantic/Stanley</option>
+      <option value="GMT0">Atlantic/St_Helena</option>
+      <option value="ACST-9:30ACDT,M10.1.0,M4.1.0/3">Australia/Adelaide</option>
+      <option value="AEST-10">Australia/Brisbane</option>
+      <option value="ACST-9:30ACDT,M10.1.0,M4.1.0/3">Australia/Broken_Hill</option>
+      <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia/Currie</option>
+      <option value="ACST-9:30">Australia/Darwin</option>
+      <option value="<+0845>-8:45">Australia/Eucla</option>
+      <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia/Hobart</option>
+      <option value="AEST-10">Australia/Lindeman</option>
+      <option value="<+1030>-10:30<+11>-11,M10.1.0,M4.1.0">Australia/Lord_Howe</option>
+      <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia/Melbourne</option>
+      <option value="AWST-8">Australia/Perth</option>
+      <option value="AEST-10AEDT,M10.1.0,M4.1.0/3">Australia/Sydney</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Amsterdam</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Andorra</option>
+      <option value="<+04>-4">Europe/Astrakhan</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Athens</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Belgrade</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Berlin</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Bratislava</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Brussels</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Bucharest</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Budapest</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Busingen</option>
+      <option value="EET-2EEST,M3.5.0,M10.5.0/3">Europe/Chisinau</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Copenhagen</option>
+      <option value="IST-1GMT0,M10.5.0,M3.5.0/1">Europe/Dublin</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Gibraltar</option>
+      <option value="GMT0BST,M3.5.0/1,M10.5.0">Europe/Guernsey</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Helsinki</option>
+      <option value="GMT0BST,M3.5.0/1,M10.5.0">Europe/Isle_of_Man</option>
+      <option value="<+03>-3">Europe/Istanbul</option>
+      <option value="GMT0BST,M3.5.0/1,M10.5.0">Europe/Jersey</option>
+      <option value="EET-2">Europe/Kaliningrad</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Kiev</option>
+      <option value="MSK-3">Europe/Kirov</option>
+      <option value="WET0WEST,M3.5.0/1,M10.5.0">Europe/Lisbon</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Ljubljana</option>
+      <option value="GMT0BST,M3.5.0/1,M10.5.0">Europe/London</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Luxembourg</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Madrid</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Malta</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Mariehamn</option>
+      <option value="<+03>-3">Europe/Minsk</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Monaco</option>
+      <option value="MSK-3">Europe/Moscow</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Oslo</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Paris</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Podgorica</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Prague</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Riga</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Rome</option>
+      <option value="<+04>-4">Europe/Samara</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/San_Marino</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Sarajevo</option>
+      <option value="<+04>-4">Europe/Saratov</option>
+      <option value="MSK-3">Europe/Simferopol</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Skopje</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Sofia</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Stockholm</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Tallinn</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Tirane</option>
+      <option value="<+04>-4">Europe/Ulyanovsk</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Uzhgorod</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Vaduz</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Vatican</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Vienna</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Vilnius</option>
+      <option value="MSK-3">Europe/Volgograd</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Warsaw</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Zagreb</option>
+      <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Europe/Zaporozhye</option>
+      <option value="CET-1CEST,M3.5.0,M10.5.0/3">Europe/Zurich</option>
+      <option value="EAT-3">Indian/Antananarivo</option>
+      <option value="<+06>-6">Indian/Chagos</option>
+      <option value="<+07>-7">Indian/Christmas</option>
+      <option value="<+0630>-6:30">Indian/Cocos</option>
+      <option value="EAT-3">Indian/Comoro</option>
+      <option value="<+05>-5">Indian/Kerguelen</option>
+      <option value="<+04>-4">Indian/Mahe</option>
+      <option value="<+05>-5">Indian/Maldives</option>
+      <option value="<+04>-4">Indian/Mauritius</option>
+      <option value="EAT-3">Indian/Mayotte</option>
+      <option value="<+04>-4">Indian/Reunion</option>
+      <option value="<+13>-13">Pacific/Apia</option>
+      <option value="NZST-12NZDT,M9.5.0,M4.1.0/3">Pacific/Auckland</option>
+      <option value="<+11>-11">Pacific/Bougainville</option>
+      <option value="<+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45">Pacific/Chatham</option>
+      <option value="<+10>-10">Pacific/Chuuk</option>
+      <option value="<-06>6<-05>,M9.1.6/22,M4.1.6/22">Pacific/Easter</option>
+      <option value="<+11>-11">Pacific/Efate</option>
+      <option value="<+13>-13">Pacific/Enderbury</option>
+      <option value="<+13>-13">Pacific/Fakaofo</option>
+      <option value="<+12>-12">Pacific/Fiji</option>
+      <option value="<+12>-12">Pacific/Funafuti</option>
+      <option value="<-06>6">Pacific/Galapagos</option>
+      <option value="<-09>9">Pacific/Gambier</option>
+      <option value="<+11>-11">Pacific/Guadalcanal</option>
+      <option value="ChST-10">Pacific/Guam</option>
+      <option value="HST10">Pacific/Honolulu</option>
+      <option value="<+14>-14">Pacific/Kiritimati</option>
+      <option value="<+11>-11">Pacific/Kosrae</option>
+      <option value="<+12>-12">Pacific/Kwajalein</option>
+      <option value="<+12>-12">Pacific/Majuro</option>
+      <option value="<-0930>9:30">Pacific/Marquesas</option>
+      <option value="SST11">Pacific/Midway</option>
+      <option value="<+12>-12">Pacific/Nauru</option>
+      <option value="<-11>11">Pacific/Niue</option>
+      <option value="<+11>-11<+12>,M10.1.0,M4.1.0/3">Pacific/Norfolk</option>
+      <option value="<+11>-11">Pacific/Noumea</option>
+      <option value="SST11">Pacific/Pago_Pago</option>
+      <option value="<+09>-9">Pacific/Palau</option>
+      <option value="<-08>8">Pacific/Pitcairn</option>
+      <option value="<+11>-11">Pacific/Pohnpei</option>
+      <option value="<+10>-10">Pacific/Port_Moresby</option>
+      <option value="<-10>10">Pacific/Rarotonga</option>
+      <option value="ChST-10">Pacific/Saipan</option>
+      <option value="<-10>10">Pacific/Tahiti</option>
+      <option value="<+12>-12">Pacific/Tarawa</option>
+      <option value="<+13>-13">Pacific/Tongatapu</option>
+      <option value="<+12>-12">Pacific/Wake</option>
+      <option value="<+12>-12">Pacific/Wallis</option>
+      <option value="GMT0">Etc/GMT</option>
+      <option value="GMT0">Etc/GMT-0</option>
+      <option value="<+01>-1">Etc/GMT-1</option>
+      <option value="<+02>-2">Etc/GMT-2</option>
+      <option value="<+03>-3">Etc/GMT-3</option>
+      <option value="<+04>-4">Etc/GMT-4</option>
+      <option value="<+05>-5">Etc/GMT-5</option>
+      <option value="<+06>-6">Etc/GMT-6</option>
+      <option value="<+07>-7">Etc/GMT-7</option>
+      <option value="<+08>-8">Etc/GMT-8</option>
+      <option value="<+09>-9">Etc/GMT-9</option>
+      <option value="<+10>-10">Etc/GMT-10</option>
+      <option value="<+11>-11">Etc/GMT-11</option>
+      <option value="<+12>-12">Etc/GMT-12</option>
+      <option value="<+13>-13">Etc/GMT-13</option>
+      <option value="<+14>-14">Etc/GMT-14</option>
+      <option value="GMT0">Etc/GMT0</option>
+      <option value="GMT0">Etc/GMT+0</option>
+      <option value="<-01>1">Etc/GMT+1</option>
+      <option value="<-02>2">Etc/GMT+2</option>
+      <option value="<-03>3">Etc/GMT+3</option>
+      <option value="<-04>4">Etc/GMT+4</option>
+      <option value="<-05>5">Etc/GMT+5</option>
+      <option value="<-06>6">Etc/GMT+6</option>
+      <option value="<-07>7">Etc/GMT+7</option>
+      <option value="<-08>8">Etc/GMT+8</option>
+      <option value="<-09>9">Etc/GMT+9</option>
+      <option value="<-10>10">Etc/GMT+10</option>
+      <option value="<-11>11">Etc/GMT+11</option>
+      <option value="<-12>12">Etc/GMT+12</option>
+      <option value="UTC0">Etc/UCT</option>
+      <option value="UTC0">Etc/UTC</option>
+      <option value="GMT0">Etc/Greenwich</option>
+      <option value="UTC0">Etc/Universal</option>
+      <option value="UTC0">Etc/Zulu</option>
     </select>
     <button class="add-button" style="margin-top:8px;" onclick="saveTimezone()">Save Timezone</button>
   </div>
 </div>
 
 <script>
-  let pills = [];
+  let meds = [];
 
-  function loadPills() {
-    fetch('/pills').then(r=>r.json()).then(data => {
-      pills = data;
-      renderPills();
-    }).catch(err => console.error('Failed to load pills:', err));
+  function loadMeds() {
+    fetch('/meds').then(r=>r.json()).then(data => {
+      meds = data;
+      renderMeds();
+    }).catch(err => console.error('Failed to load meds:', err));
   }
 
-  function renderPills() {
-    const container = document.getElementById('pillList');
-    if (!pills || pills.length === 0) {
+  function renderMeds() {
+    const container = document.getElementById('medList');
+    if (!meds || meds.length === 0) {
       container.innerHTML = '<div class="empty-state">✨ No medications yet.<br>Tap + to add.</div>';
       return;
     }
     let html = '';
-    pills.forEach((pill, idx) => {
-      html += `<div class="pill-item">
-        <div class="pill-info">
-          <span class="pill-name">${pill.name}</span>
-          <span class="pill-time">🕒 ${String(pill.hour).padStart(2,'0')}:${String(pill.minute).padStart(2,'0')}</span>
+    meds.forEach((med, idx) => {
+      html += `<div class="med-item">
+        <div class="med-info">
+          <span class="med-name">${med.name}</span>
+          <span class="med-time">🕒 ${String(med.hour).padStart(2,'0')}:${String(med.minute).padStart(2,'0')}</span>
         </div>
-        <div class="delete-btn" onclick="deletePill(${idx})">🗑️</div>
+        <div class="delete-btn" onclick="deleteMed(${idx})">🗑️</div>
       </div>`;
     });
     container.innerHTML = html;
@@ -599,13 +1044,13 @@ void handleRoot() {
   }
   function hideForm() {
     document.getElementById('addForm').style.display = 'none';
-    document.getElementById('pillName').value = '';
+    document.getElementById('medName').value = '';
     document.getElementById('hour').value = '';
     document.getElementById('minute').value = '';
   }
 
-  function savePill() {
-    const name = document.getElementById('pillName').value.trim();
+  function saveMed() {
+    const name = document.getElementById('medName').value.trim();
     const hour = parseInt(document.getElementById('hour').value);
     const minute = parseInt(document.getElementById('minute').value);
     if (!name || isNaN(hour) || isNaN(minute) || hour<0 || hour>23 || minute<0 || minute>59) {
@@ -616,21 +1061,24 @@ void handleRoot() {
       .then(response => {
         if (response.ok) {
           hideForm();
-          loadPills();
+          loadMeds();
         } else {
-          alert('Failed to add pill');
+          alert('Failed to add med');
         }
       });
   }
 
-  function deletePill(index) {
-    if (confirm('Delete this pill?')) {
-      fetch(`/delete?index=${index}`).then(() => loadPills());
+  function deleteMed(index) {
+    if (confirm('Delete this med?')) {
+      fetch(`/delete?index=${index}`).then(() => loadMeds());
     }
   }
 
   function saveTimezone() {
-    const tz = parseInt(document.getElementById('timezoneSelect').value);
+    const str = document.getElementById('timezoneSelect').value;
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(str));
+    const tz = div.innerHTML;
     fetch(`/config?tz=${tz}`).then(() => alert('Timezone saved'));
   }
 
@@ -649,8 +1097,8 @@ void handleRoot() {
     document.getElementById('idleOutput').value = data.idle;
   });
 
-  loadPills();
-  setInterval(loadPills, 5000);
+  loadMeds();
+  setInterval(loadMeds, 5000);
 </script>
 </body>
 </html>
@@ -658,58 +1106,56 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-void handleGetPills() {
+void handleGetMeds() {
   String json = "[";
-  for (int i = 0; i < pillCount; i++) {
+  for (int i = 0; i < medCount; i++) {
     if (i > 0) json += ",";
-    json += "{\"name\":\"" + String(pills[i].name) + "\",";
-    json += "\"hour\":" + String(pills[i].hour) + ",";
-    json += "\"minute\":" + String(pills[i].minute) + "}";
+    json += "{\"name\":\"" + String(meds[i].name) + "\",";
+    json += "\"hour\":" + String(meds[i].hour) + ",";
+    json += "\"minute\":" + String(meds[i].minute) + "}";
   }
   json += "]";
   server.send(200, "application/json", json);
 }
 
-void handleAddPill() {
-  if (server.hasArg("name") && server.hasArg("hour") && server.hasArg("minute") && pillCount < MAX_PILLS) {
+void handleAddMed() {
+  if (server.hasArg("name") && server.hasArg("hour") && server.hasArg("minute") && medCount < MAX_MEDS) {
     String name = server.arg("name");
     int hour = server.arg("hour").toInt();
     int minute = server.arg("minute").toInt();
-    name.toCharArray(pills[pillCount].name, 24);
-    pills[pillCount].hour = hour;
-    pills[pillCount].minute = minute;
-    pills[pillCount].active = true;
-    pills[pillCount].takenToday = false;
-    pillCount++;
-    savePills();
+    name.toCharArray(meds[medCount].name, 24);
+    meds[medCount].hour = hour;
+    meds[medCount].minute = minute;
+    meds[medCount].active = true;
+    meds[medCount].takenToday = false;
+    medCount++;
+    saveMeds();
     server.send(200, "text/plain", "OK");
   } else {
     server.send(400, "text/plain", "Bad Request");
   }
 }
 
-void handleDeletePill() {
+void handleDeleteMed() {
   if (server.hasArg("index")) {
     int idx = server.arg("index").toInt();
-    if (idx >= 0 && idx < pillCount) {
-      for (int i = idx; i < pillCount - 1; i++) pills[i] = pills[i + 1];
-      pillCount--;
-      savePills();
+    if (idx >= 0 && idx < medCount) {
+      for (int i = idx; i < medCount - 1; i++) meds[i] = meds[i + 1];
+      medCount--;
+      saveMeds();
       server.send(200, "text/plain", "OK");
     } else server.send(400, "text/plain", "Bad Request");
   } else server.send(400, "text/plain", "Bad Request");
 }
 
 void handleGetConfig() {
-  String json = "{\"tz\":" + String(timezoneMinutes) + ", \"active\":" + String(activeBrightness) + ", \"idle\":" + String(idleBrightness) + "}";
+  String json = "{\"tz\":\"" + timezone + "\", \"active\":" + String(activeBrightness) + ", \"idle\":" + String(idleBrightness) + "}";
   server.send(200, "application/json", json);
 }
 
 void handleSetConfig() {
   if (server.hasArg("tz")) {
-    timezoneMinutes = server.arg("tz").toInt();
-    if (timezoneMinutes < -720) timezoneMinutes = 0;
-    if (timezoneMinutes > 840) timezoneMinutes = 330;
+    timezone = server.urlDecode(server.arg("tz"));
     saveTimezone();
     syncTime();
   }
@@ -731,14 +1177,15 @@ void handleSetConfig() {
 // ========== SETUP ==========
 void setup() {
   Serial.begin(115200);
-  // while (!Serial) delay(10);   // <-- REMOVED – device starts without waiting for Serial Monitor
-  Serial.println("\n=== Pill Reminder ===");
+  Serial.println("\n=== Med Reminder ===");
 
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
+  loadActiveBrightness();
+  loadIdleBrightness();
   ledcAttach(BACKLIGHT_PIN, PWM_FREQ, PWM_RES);
   setBrightness(activeBrightness);
   
@@ -747,9 +1194,8 @@ void setup() {
 
   round_display_touch_init();
 
-  EEPROM.begin(EEPROM_SIZE);
   loadTimezone();
-  loadPills();
+  loadMeds();
 
   WiFi.begin(ssid, password);
   int attempts = 0;
@@ -780,9 +1226,9 @@ void setup() {
   }
 
   server.on("/", handleRoot);
-  server.on("/pills", handleGetPills);
-  server.on("/add", handleAddPill);
-  server.on("/delete", handleDeletePill);
+  server.on("/meds", handleGetMeds);
+  server.on("/add", handleAddMed);
+  server.on("/delete", handleDeleteMed);
   server.on("/getconfig", handleGetConfig);
   server.on("/config", handleSetConfig);
   server.begin();
@@ -813,15 +1259,16 @@ void loop() {
     if (chsc6x_get_xy(x, y)) {
       if (reminderActive) {
         if (reminderIndex >= 0) {
-          pills[reminderIndex].takenToday = true;
-          pills[reminderIndex].active = false;
-          savePills();
+          meds[reminderIndex].takenToday = true;
+          meds[reminderIndex].active = false;
+          saveMeds();
         }
-        drawPillTakenScreen();
+        drawMedTakenScreen();
         reminderActive = false;
         reminderIndex = -1;
         drawClockScreen();
       } else {
+        drawClockScreen();
         setBrightness(activeBrightness);
         delay(3000);
         setBrightness(idleBrightness);
@@ -835,12 +1282,13 @@ void loop() {
   if (getLocalTime(&timeinfo)) {
     if (timeinfo.tm_yday != lastDay) {
       lastDay = timeinfo.tm_yday;
-      for (int i = 0; i < pillCount; i++) {
-        pills[i].takenToday = false;
-        pills[i].active = true;
+      for (int i = 0; i < medCount; i++) {
+        meds[i].takenToday = false;
+        meds[i].active = true;
       }
-      savePills();
+      saveMeds();
       Serial.println("Daily reset");
+      drawClockScreen();
     }
   }
 
