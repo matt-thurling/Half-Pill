@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <EEPROM.h>
+#include <SPI.h>
 #include <TFT_eSPI.h>
 #include <Wire.h>
 #include <time.h>
@@ -19,6 +20,12 @@ const char* password = "";
 #define CHSC6X_I2C_ID  0x2e
 #define CHSC6X_READ_POINT_LEN 5
 #define TOUCH_INT      D7
+// brightness controls
+#define BACKLIGHT_PIN  21        // Round Display Backlight Pin
+#define PWM_FREQ       5000     // 5 kHz frequency to eliminate audible buzzing
+#define PWM_RES        8        // 8-bit resolution (values from 0 to 255)
+int activeBrightness = 255;
+int idleBrightness =   10;
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -29,9 +36,11 @@ int timezoneMinutes = 330;   // UTC+5:30
 
 // ========== EEPROM ==========
 #define EEPROM_SIZE     512
-#define EEPROM_PILL_COUNT_ADDR 0
-#define EEPROM_PILL_DATA_ADDR  4
-#define EEPROM_TZ_ADDR         200
+#define EEPROM_PILL_COUNT_ADDR    0
+#define EEPROM_PILL_DATA_ADDR     4
+#define EEPROM_TZ_ADDR            200
+#define EEPROM_ACTIVE_BRIGHT_ADDR 500
+#define EEPROM_IDLE_BRIGHT_ADDR   501
 #define MAX_PILLS       20
 
 struct Pill {
@@ -92,6 +101,15 @@ bool chsc6x_get_xy(int32_t &x, int32_t &y) {
   return false;
 }
 
+// ========== Display Brightness ======
+// Helper function to dynamically change brightness (0 to 100)
+void setBrightness(int value) {
+  if (value < 0)   value = 0;
+  if (value > 255) value = 255;
+  //value = value * 2.55;
+  ledcWrite(BACKLIGHT_PIN, value);
+}
+
 // ========== EEPROM Helpers ==========
 void savePills() {
   EEPROM.writeInt(EEPROM_PILL_COUNT_ADDR, pillCount);
@@ -119,6 +137,26 @@ void saveTimezone() {
 void loadTimezone() {
   timezoneMinutes = EEPROM.readInt(EEPROM_TZ_ADDR);
   if (timezoneMinutes < -720 || timezoneMinutes > 840) timezoneMinutes = 330;
+}
+
+void saveActiveBrightness() {
+  EEPROM.writeInt(EEPROM_ACTIVE_BRIGHT_ADDR, activeBrightness);
+  EEPROM.commit();
+}
+
+void loadActiveBrightness() {
+  activeBrightness = EEPROM.readInt(EEPROM_ACTIVE_BRIGHT_ADDR);
+  if (activeBrightness < 0 || activeBrightness > 255) activeBrightness = 255;
+}
+
+void saveIdleBrightness() {
+  EEPROM.writeInt(EEPROM_IDLE_BRIGHT_ADDR, idleBrightness);
+  EEPROM.commit();
+}
+
+void loadIdleBrightness() {
+  idleBrightness = EEPROM.readInt(EEPROM_IDLE_BRIGHT_ADDR);
+  if (idleBrightness < 0 || idleBrightness > 255) idleBrightness = 10;
 }
 
 // ========== Time Formatting ==========
@@ -245,6 +283,7 @@ void updateClockTime() {
   tft.drawString(newTime, lastTimeX, lastTimeY);
   
   lastTimeStr = newTime;
+  setBrightness(idleBrightness);
 }
 
 // ========== REMINDER SCREEN ==========
@@ -263,6 +302,7 @@ void drawReminderScreen(int idx) {
   
   tft.setFreeFont(&FreeSans9pt7b);
   tft.drawString("Tap to take", 75, 204);
+  setBrightness(activeBrightness);
 }
 
 void drawPillTakenScreen() {
@@ -408,6 +448,15 @@ void handleRoot() {
       margin-bottom: 8px;
       font-size: 15px;
     }
+    output {
+      color: #94a3b8;
+      display: block;
+      margin-bottom: 8px;
+      font-size: 15px;
+    }
+    input[type="range"] {
+      width: 100%;
+    }
     select {
       width: 100%;
       padding: 12px 16px;
@@ -482,7 +531,17 @@ void handleRoot() {
       <button class="btn cancel" onclick="hideForm()">Cancel</button>
     </div>
   </div>
-  
+  <div class="section-title">☀️ Display Brightness</div>
+  <div class="config-group">
+
+    <label for="activeBrightness">Active Brightness (0-255):</label><br>
+    <output id="activeOutput"></output>
+    <input type="range" id="activeBrightness" min="0" max="255" oninput="activeOutput.value = activeBrightness.value"><br>
+    <label for="idleBrightness">Idle Brightness (0-255):</label><br>
+    <output id="idleOutput"></output>
+    <input type="range" id="idleBrightness" min="0" max="255" oninput="idleOutput.value = idleBrightness.value"><br>
+    <button class="add-button" onclick="saveBrightness()">Save</button>
+  </div>
   <div class="section-title">⚙️ Timezone</div>
   <div class="config-group">
     <label>UTC Offset</label>
@@ -575,8 +634,19 @@ void handleRoot() {
     fetch(`/config?tz=${tz}`).then(() => alert('Timezone saved'));
   }
 
+  function saveBrightness() {
+    const active = parseInt(document.getElementById('activeBrightness').value);
+    fetch(`/config?active=${active}`).then(() => alert('Active Brightness saved'));
+    const idle = parseInt(document.getElementById('idleBrightness').value);
+    fetch(`/config?idle=${idle}`).then(() => alert('Idle Brightness saved'));
+  }
+
   fetch('/getconfig').then(r=>r.json()).then(data => {
     document.getElementById('timezoneSelect').value = data.tz;
+    document.getElementById('activeBrightness').value = data.active;
+    document.getElementById('activeOutput').value = data.active;
+    document.getElementById('idleBrightness').value = data.idle;
+    document.getElementById('idleOutput').value = data.idle;
   });
 
   loadPills();
@@ -631,7 +701,7 @@ void handleDeletePill() {
 }
 
 void handleGetConfig() {
-  String json = "{\"tz\":" + String(timezoneMinutes) + "}";
+  String json = "{\"tz\":" + String(timezoneMinutes) + ", \"active\":" + String(activeBrightness) + ", \"idle\":" + String(idleBrightness) + "}";
   server.send(200, "application/json", json);
 }
 
@@ -642,6 +712,18 @@ void handleSetConfig() {
     if (timezoneMinutes > 840) timezoneMinutes = 330;
     saveTimezone();
     syncTime();
+  }
+  if (server.hasArg("active")) {
+    activeBrightness = server.arg("active").toInt();
+    if (activeBrightness < 0) activeBrightness = 0;
+    if (activeBrightness > 255) activeBrightness = 255;
+    saveActiveBrightness();
+  }
+  if (server.hasArg("idle")) {
+    idleBrightness = server.arg("idle").toInt();
+    if (idleBrightness < 0) idleBrightness = 0;
+    if (idleBrightness > 255) idleBrightness = 255;
+    saveIdleBrightness();
   }
   server.send(200, "text/plain", "OK");
 }
@@ -656,6 +738,9 @@ void setup() {
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  ledcAttach(BACKLIGHT_PIN, PWM_FREQ, PWM_RES);
+  setBrightness(activeBrightness);
   
   // Show boot bitmap
   drawBootBitmap();
@@ -736,6 +821,10 @@ void loop() {
         reminderActive = false;
         reminderIndex = -1;
         drawClockScreen();
+      } else {
+        setBrightness(activeBrightness);
+        delay(3000);
+        setBrightness(idleBrightness);
       }
       delay(200);
     }
